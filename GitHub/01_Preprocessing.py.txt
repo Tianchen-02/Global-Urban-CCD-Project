@@ -1,0 +1,143 @@
+# -*- coding: utf-8 -*-
+"""
+01_Preprocessing.py
+-------------------
+此脚本用于处理全球城市核心区的多源面板数据。
+主要功能：
+1. 读取原始面板数据 (Excel/CSV)。
+2. 执行数据清洗（处理缺失值、异常值）。
+3. 特征工程：
+   - 紧凑度 (Compactness) 归一化。
+   - 夜间灯光 (NTL) 的跨传感器校正（DMSP-OLS 与 VIIRS 的归一化）。
+   - 人口数据的对数变换。
+   - 碳热协同度 (CCD) 的标准化 (Z-score)。
+4. 将宽表 (Wide Format) 转换为长表 (Long Format) 以适配 GAM 和机器学习模型。
+5. 导出处理后的数据集。
+
+作者: [Your Name]
+日期: 2025-02-12
+依赖: pandas, numpy
+"""
+
+import pandas as pd
+import numpy as np
+import os
+
+# 配置路径
+# 请确保 'Final_Panel_Data_for_GAM_Analysis.xlsx' 位于 ../Data/ 目录下
+# 或者根据实际情况修改路径
+INPUT_FILE = './Data/Final_Panel_Data_for_GAM_Analysis.xlsx - Sheet1.csv'  # 如果是csv
+# INPUT_FILE = './Data/Final_Panel_Data_for_GAM_Analysis.xlsx' # 如果是xlsx
+OUTPUT_DIR = './Results'
+OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'Processed_Panel_Data.csv')
+
+def load_data(filepath):
+    """读取数据，支持 CSV 和 Excel"""
+    print(f"正在读取数据: {filepath}...")
+    if filepath.endswith('.csv'):
+        df = pd.read_csv(filepath)
+    else:
+        df = pd.read_excel(filepath)
+    print(f"原始数据大小: {df.shape}")
+    return df
+
+def preprocess_wide_to_long(df):
+    """
+    将宽表转换为长表，并进行特征工程。
+    原始数据包含 2000, 2010, 2020 三年的列 (e.g., Compact_2000, Compact_2010...)。
+    """
+    print("正在进行长宽表转换与特征工程...")
+    
+    long_df = pd.DataFrame()
+    years = [2000, 2010, 2020]
+    
+    for year in years:
+        # 提取当年的列
+        # 注意：这里根据您的数据列名进行动态提取
+        # NTL 列名在 2020 年是 VIIRS，前两年是 DMSP
+        ntl_col = f'NTL_{year}_VIIRS' if year == 2020 else f'NTL_{year}_DMSP'
+        
+        cols = {
+            'UID': 'UID',
+            'City_Name_EN': 'City_Name',
+            'Lat': 'Lat',
+            'Lon': 'Lon',
+            'Hemi': 'Hemi',
+            f'Compact_{year}_Norm': 'Compact',
+            f'Pop_{year}': 'Pop',
+            ntl_col: 'NTL',
+            f'CCD_{year}': 'CCD',
+            f'LST_{year}': 'LST' # 如果有LST列
+        }
+        
+        # 检查列是否存在，只提取存在的列
+        existing_cols = {k: v for k, v in cols.items() if k in df.columns}
+        
+        temp = df[list(existing_cols.keys())].copy()
+        temp.rename(columns=existing_cols, inplace=True)
+        temp['Year'] = year
+        
+        # --- 特征工程 (按年份处理) ---
+        
+        # 1. NTL 归一化 (Min-Max Scaling)
+        # 因为 DMSP (0-63) 和 VIIRS (范围更大) 量纲不同，必须按年归一化
+        if 'NTL' in temp.columns:
+            min_ntl = temp['NTL'].min()
+            max_ntl = temp['NTL'].max()
+            temp['NTL_Norm'] = (temp['NTL'] - min_ntl) / (max_ntl - min_ntl)
+        
+        # 2. 人口对数变换 (Log Transformation)
+        # 缓解右偏分布
+        if 'Pop' in temp.columns:
+            temp['Pop_Log'] = np.log1p(temp['Pop'])
+            
+        long_df = pd.concat([long_df, temp], ignore_index=True)
+
+    # --- 全局特征工程 ---
+    
+    # 3. CCD Z-score 标准化 (可选，用于状态空间分析)
+    if 'CCD' in long_df.columns:
+        mean_ccd = long_df['CCD'].mean()
+        std_ccd = long_df['CCD'].std()
+        long_df['CCD_Z'] = (long_df['CCD'] - mean_ccd) / std_ccd
+
+    # 4. 删除缺失值
+    # 保留用于建模的核心变量不为空的行
+    model_cols = ['CCD', 'Compact', 'Pop_Log', 'NTL_Norm']
+    before_drop = len(long_df)
+    long_df.dropna(subset=[c for c in model_cols if c in long_df.columns], inplace=True)
+    after_drop = len(long_df)
+    print(f"清洗缺失值: 删除 {before_drop - after_drop} 行，剩余 {after_drop} 行。")
+
+    return long_df
+
+def save_data(df, output_path):
+    """保存处理后的数据"""
+    if not os.path.exists(os.path.dirname(output_path)):
+        os.makedirs(os.path.dirname(output_path))
+    
+    df.to_csv(output_path, index=False)
+    print(f"处理后的数据已保存至: {output_path}")
+
+def main():
+    # 1. 加载
+    if not os.path.exists(INPUT_FILE):
+        print(f"错误: 找不到输入文件 {INPUT_FILE}。请检查路径。")
+        return
+    
+    df_raw = load_data(INPUT_FILE)
+    
+    # 2. 处理
+    df_processed = preprocess_wide_to_long(df_raw)
+    
+    # 3. 简单统计检查
+    print("\n数据概览 (前5行):")
+    print(df_processed.head())
+    print("\n描述性统计:")
+    print(df_processed[['CCD', 'Compact', 'NTL_Norm', 'Pop_Log']].describe())
+    
+    # 4. 保存
+    save_data(df_processed, OUTPUT_FILE)
+
+if __name__ == "__main__":
+    main()

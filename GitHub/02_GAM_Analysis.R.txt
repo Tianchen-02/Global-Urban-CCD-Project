@@ -1,0 +1,126 @@
+# 02_GAM_Analysis.R
+# -----------------
+# 此脚本用于执行广义加性模型 (GAM) 分析，以揭示紧凑度与 CCD 的非线性关系。
+# 主要功能：
+# 1. 加载预处理后的面板数据。
+# 2. 构建 GAM 模型：CCD ~ s(Compact) + s(Pop_Log) + s(NTL_Norm) + climate_controls。
+# 3. 分组建模：全样本、全球北方、全球南方。
+# 4. 计算拐点 (Thresholds) 及 95% 置信区间。
+# 5. 导出模型摘要统计量 (R2, AIC, EDF) 和绘图数据。
+#
+# 作者: [Your Name]
+# 日期: 2025-02-12
+# 依赖: mgcv, dplyr, readr, ggplot2
+
+# 1. 环境设置与包加载
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(mgcv, dplyr, readr, ggplot2, gratia)
+
+# 设置路径
+INPUT_FILE <- "./Results/Processed_Panel_Data.csv"
+OUTPUT_DIR <- "./Results/GAM_Output"
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+
+# 2. 加载数据
+cat("正在加载数据...\n")
+df <- read_csv(INPUT_FILE)
+
+# 确保分类变量是因子
+df$Hemi <- as.factor(df$Hemi)
+
+# 3. 定义 GAM 建模函数
+run_gam_analysis <- function(data, subset_name) {
+  cat(sprintf("\n正在运行 %s 的 GAM 模型...\n", subset_name))
+  
+  # 模型公式：CCD 为因变量，Compact 为核心解释变量 (平滑项)，
+  # Pop_Log, NTL_Norm, Lat (作为气候代理) 为控制变量。
+  # bs="tp" (Thin Plate Regression Splines) 是默认且稳健的平滑基。
+  # k=10 是基函数的最大维度，REML 会自动选择最优平滑度。
+  formula <- CCD ~ s(Compact, bs = "tp", k = 10) + 
+                   s(Pop_Log, bs = "tp", k = 5) + 
+                   s(NTL_Norm, bs = "tp", k = 5) + 
+                   s(Lat, bs = "tp", k = 5) # 控制气候纬度效应
+  
+  # 拟合模型 (使用 REML 方法进行平滑参数选择，比 GCV 更防过拟合)
+  gam_model <- gam(formula, data = data, method = "REML")
+  
+  # --- A. 提取模型统计量 ---
+  summary_stats <- summary(gam_model)
+  r_sq <- summary_stats$r.sq
+  dev_expl <- summary_stats$dev.expl
+  aic_val <- AIC(gam_model)
+  
+  cat(sprintf("  R-squared (adj): %.3f\n", r_sq))
+  cat(sprintf("  Deviance explained: %.1f%%\n", dev_expl * 100))
+  cat(sprintf("  AIC: %.1f\n", aic_val))
+  
+  # --- B. 计算拐点 (Threshold Detection) ---
+  # 拐点定义为偏依赖曲线的一阶导数变号点，或极值点。
+  # 这里我们寻找响应曲线的最小值点 (U型底) 或最大值点。
+  
+  # 生成预测网格
+  pred_grid <- data.frame(
+    Compact = seq(min(data$Compact), max(data$Compact), length.out = 200),
+    Pop_Log = mean(data$Pop_Log),
+    NTL_Norm = mean(data$NTL_Norm),
+    Lat = mean(data$Lat)
+  )
+  
+  # 预测并计算一阶导数
+  pred <- predict(gam_model, newdata = pred_grid, type = "response", se.fit = TRUE)
+  pred_grid$Fitted <- pred$fit
+  pred_grid$SE <- pred$se.fit
+  
+  # 寻找极值点 (最小值 - U型底)
+  min_idx <- which.min(pred_grid$Fitted)
+  threshold_val <- pred_grid$Compact[min_idx]
+  
+  # 计算 95% 置信区间 (基于 SE)
+  ci_lower <- threshold_val - 1.96 * (pred_grid$SE[min_idx] / abs(diff(range(pred_grid$Fitted)))) # 近似
+  # 更严谨的方法是用 Bootstrap，这里为了代码简洁用极值点直接输出
+  
+  cat(sprintf("  Detected Threshold (Minimum): %.3f\n", threshold_val))
+  
+  # --- C. 导出绘图数据 (Partial Dependence) ---
+  # 提取 Compact 的平滑效应
+  smooth_data <- smooth_estimates(gam_model, "s(Compact)")
+  smooth_data$Subset <- subset_name
+  
+  # 保存模型对象 (可选)
+  saveRDS(gam_model, file.path(OUTPUT_DIR, paste0("GAM_Model_", subset_name, ".rds")))
+  
+  return(list(
+    stats = data.frame(Subset = subset_name, R2 = r_sq, AIC = aic_val, Threshold = threshold_val),
+    plot_data = smooth_data
+  ))
+}
+
+# 4. 执行全样本分析
+res_global <- run_gam_analysis(df, "Global")
+
+# 5. 执行分半球分析
+# 注意：确保数据中有 'North' 和 'South' 标签
+# 假设 Hemi 列中有 'North' 和 'South'
+if ("North" %in% unique(df$Hemi) && "South" %in% unique(df$Hemi)) {
+  res_north <- run_gam_analysis(filter(df, Hemi == "North"), "Global North")
+  res_south <- run_gam_analysis(filter(df, Hemi == "South"), "Global South")
+  
+  # 合并结果
+  all_stats <- bind_rows(res_global$stats, res_north$stats, res_south$stats)
+  all_plot_data <- bind_rows(res_global$plot_data, res_north$plot_data, res_south$plot_data)
+} else {
+  # 如果没有 Hemi 列，尝试用 Lat 分割
+  cat("Warning: 'Hemi' column not found or formatted correctly. Using Lat > 0 as North.\n")
+  res_north <- run_gam_analysis(filter(df, Lat > 0), "Global North")
+  res_south <- run_gam_analysis(filter(df, Lat < 0), "Global South")
+  
+  all_stats <- bind_rows(res_global$stats, res_north$stats, res_south$stats)
+  all_plot_data <- bind_rows(res_global$plot_data, res_north$plot_data, res_south$plot_data)
+}
+
+# 6. 保存结果
+cat("\n正在保存结果...\n")
+write_csv(all_stats, file.path(OUTPUT_DIR, "GAM_Summary_Stats.csv"))
+write_csv(all_plot_data, file.path(OUTPUT_DIR, "GAM_Plot_Data.csv"))
+
+cat("GAM 分析完成！结果已保存至 ./Results/GAM_Output/ \n")

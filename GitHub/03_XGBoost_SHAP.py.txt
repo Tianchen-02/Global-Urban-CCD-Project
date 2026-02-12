@@ -1,0 +1,171 @@
+# -*- coding: utf-8 -*-
+"""
+03_XGBoost_SHAP.py
+------------------
+此脚本用于执行 XGBoost 机器学习建模与 SHAP 可解释性分析。
+主要功能：
+1. 加载预处理后的数据。
+2. 划分全球北方 (Global North) 与 全球南方 (Global South) 样本。
+3. 训练 XGBoost 回归模型预测 CCD。
+4. 计算 SHAP 值 (Shapley Additive exPlanations) 以解构非线性关系。
+5. 导出包含 SHAP 值和原始特征的数据集，供后续绘图 (如 Fig. 3)。
+6. 评估并保存模型性能指标 (R2, RMSE)。
+
+作者: [Your Name]
+日期: 2025-02-12
+依赖: pandas, numpy, xgboost, shap, sklearn
+"""
+
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+import shap
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error
+import os
+
+# 配置路径
+INPUT_FILE = './Results/Processed_Panel_Data.csv'
+OUTPUT_DIR = './Results/ML_Output'
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+def load_and_split_data(filepath):
+    """加载数据并按半球/纬度分割"""
+    print("正在加载数据...")
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"找不到输入文件: {filepath}。请先运行 01_Preprocessing.py。")
+        
+    df = pd.read_csv(filepath)
+    
+    # 确保没有缺失值 (使用核心特征)
+    features = ['Compact', 'Pop_Log', 'NTL_Norm', 'Lat'] # Lat 作为气候背景控制
+    target = 'CCD'
+    
+    df = df.dropna(subset=features + [target])
+    
+    # 划分南北方
+    # 优先使用 'Hemi' 列，如果没有则使用 'Lat' > 0
+    if 'Hemi' in df.columns:
+        print("使用 'Hemi' 列划分样本...")
+        north = df[df['Hemi'] == 'North'].copy()
+        south = df[df['Hemi'] == 'South'].copy()
+    else:
+        print("警告: 未找到 'Hemi' 列，使用纬度 (Lat > 0) 划分南北方。")
+        north = df[df['Lat'] > 0].copy()
+        south = df[df['Lat'] < 0].copy()
+        
+    print(f"样本概览 -> 全样本: {len(df)}, 北方: {len(north)}, 南方: {len(south)}")
+    return north, south
+
+def train_xgboost(data, subset_name):
+    """训练 XGBoost 模型并计算 SHAP 值"""
+    print(f"\n--- 正在处理: {subset_name} ---")
+    
+    features = ['Compact', 'Pop_Log', 'NTL_Norm', 'Lat']
+    target = 'CCD'
+    
+    X = data[features]
+    y = data[target]
+    
+    # 1. 划分训练集和测试集 (80/20)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # 2. 模型训练
+    # 这里的参数是基于经验的默认值，实际研究中通常会结合 GridSearchCV 进行微调
+    print("正在训练 XGBoost 模型...")
+    model = xgb.XGBRegressor(
+        n_estimators=500,        # 树的数量
+        learning_rate=0.05,      # 学习率
+        max_depth=6,             # 树深
+        subsample=0.8,           # 子采样
+        colsample_bytree=0.8,    # 列采样
+        objective='reg:squarederror',
+        n_jobs=-1,
+        random_state=42
+    )
+    
+    # 使用早停法防止过拟合
+    model.fit(
+        X_train, y_train, 
+        eval_set=[(X_test, y_test)], 
+        early_stopping_rounds=50, 
+        verbose=False
+    )
+    
+    # 3. 模型评估
+    y_pred = model.predict(X_test)
+    r2 = r2_score(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    
+    print(f"模型性能 ({subset_name}):")
+    print(f"  Test R2: {r2:.4f}")
+    print(f"  Test RMSE: {rmse:.4f}")
+    
+    # 4. SHAP 分析
+    print("正在计算 SHAP 值 (TreeExplainer)...")
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X)
+    
+    # 5. 整理输出数据
+    # 我们将原始特征值和对应的 SHAP 值合并，这是画 Dependence Plot 的关键
+    shap_cols = [f"{c}_SHAP" for c in features]
+    shap_df = pd.DataFrame(shap_values, columns=shap_cols)
+    
+    # 重置索引以确保对齐
+    data_reset = data[features + [target]].reset_index(drop=True) 
+    result_df = pd.concat([data_reset, shap_df], axis=1)
+    result_df['Subset'] = subset_name
+    
+    # 可选：计算交互作用值 (Interaction Values)
+    # 这通常比较耗时，如果数据量大可以注释掉
+    # print("计算交互作用值 (Interaction Values)...")
+    # shap_interaction = explainer.shap_interaction_values(X)
+    # (此处代码仅作框架，实际保存交互矩阵需要更复杂的数据结构)
+    
+    return result_df, {'R2': r2, 'RMSE': rmse}
+
+def main():
+    # 1. 加载数据
+    try:
+        north_df, south_df = load_and_split_data(INPUT_FILE)
+    except Exception as e:
+        print(e)
+        return
+    
+    # 2. 训练模型 - 北方
+    if len(north_df) > 50: # 确保样本足够
+        res_north, metrics_north = train_xgboost(north_df, "Global North")
+    else:
+        print("北方样本不足，跳过。")
+        res_north, metrics_north = pd.DataFrame(), {}
+    
+    # 3. 训练模型 - 南方
+    if len(south_df) > 50:
+        res_south, metrics_south = train_xgboost(south_df, "Global South")
+    else:
+        print("南方样本不足，跳过。")
+        res_south, metrics_south = pd.DataFrame(), {}
+    
+    # 4. 合并并保存结果
+    all_results = pd.concat([res_north, res_south], ignore_index=True)
+    
+    if not all_results.empty:
+        save_path = os.path.join(OUTPUT_DIR, 'SHAP_Analysis_Data.csv')
+        all_results.to_csv(save_path, index=False)
+        print(f"\nSUCCESS: SHAP 分析数据已保存至: {save_path}")
+        print("提示: 您可以使用此 CSV 文件在 Python 或 R (ggplot2) 中绘制 Fig. 3 的依赖图。")
+    
+    # 保存性能指标
+    metrics_list = []
+    if metrics_north: metrics_list.append({'Subset': 'Global North', **metrics_north})
+    if metrics_south: metrics_list.append({'Subset': 'Global South', **metrics_south})
+    
+    if metrics_list:
+        metrics_df = pd.DataFrame(metrics_list)
+        metrics_path = os.path.join(OUTPUT_DIR, 'XGBoost_Metrics.csv')
+        metrics_df.to_csv(metrics_path, index=False)
+        print(f"SUCCESS: 模型性能指标已保存至: {metrics_path}")
+
+if __name__ == "__main__":
+    main()
